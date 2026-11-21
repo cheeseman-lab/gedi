@@ -363,7 +363,7 @@ public class CleavageModelEstimator {
 							if (RiboUtils.hasLeadingMismatch(mard, d)) {
 								if (RiboUtils.isLeadingMismatchInsideGenomicRegion(mard, d)) 
 									mard.addCountsForDistinct(d, data[l][first%3][1], ReadCountMode.Weight);
-								else // if it were inside, the read would be one bp longer and the codon position would one farther away
+								else if (l+1<=maxLength) // if it were inside, the read would be one bp longer and the codon position would one farther away; longer than maxLength: skipped, like any read longer than maxLength
 									mard.addCountsForDistinct(d, data[l+1][(first+1)%3][1], ReadCountMode.Weight);
 							} else
 								mard.addCountsForDistinct(d, data[l][first%3][0], ReadCountMode.Weight);
