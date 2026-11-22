@@ -80,7 +80,7 @@ public class RiboModel implements BinarySerializable {
 	private int changepointBandwidth;
 
 	
-	private int minReadLength = -1;
+	private volatile int minReadLength = -1; // written last: once it is set, maxReadLength is too
 	private int maxReadLength = -1;
 
 	
@@ -249,12 +249,16 @@ public class RiboModel implements BinarySerializable {
 
 		DoubleRanking rank = new DoubleRanking(ltoTotalPosterior);
 		rank.sort(false);
+		// locals: other codon inference threads use the range while it is computed (isValidReadLength)
+		int minReadLength, maxReadLength;
 		minReadLength = maxReadLength = rank.getOriginalIndex(0);
 		int ind=0;
 		for (double sum = 0; sum<0.99 && ind<ltoTotalPosterior.length; sum+=rank.getValue(ind++)) {
 			minReadLength = Math.min(minReadLength,rank.getOriginalIndex(ind));
 			maxReadLength = Math.max(maxReadLength,rank.getOriginalIndex(ind));
 		}
+		this.maxReadLength = maxReadLength;
+		this.minReadLength = minReadLength;
 
 		rank.restore();
 		return ltoTotalPosterior;
