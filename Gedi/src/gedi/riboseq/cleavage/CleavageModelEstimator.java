@@ -617,20 +617,27 @@ public class CleavageModelEstimator {
 			threads[0].run();
 			best = 0;
 		} else {
-			for (int i=0; i<nthreads; i++) {
-				threads[i] = new CleavageModelEstimatorThread(this, c, maxPos, repeats/nthreads,seed*(i+1));
+			// with a seed: the repeats of one thread with this seed, split into consecutive blocks;
+			// each thread skips the random numbers of the repeats before its block, the first best wins
+			int total = Math.max(repeats,1);
+			int n = seed>=0?Math.min(nthreads, total):nthreads;
+			for (int i=0; i<n; i++) {
+				if (seed>=0)
+					threads[i] = new CleavageModelEstimatorThread(this, c, maxPos, repeats, seed, (int)((long)total*i/n), (int)((long)total*(i+1)/n));
+				else
+					threads[i] = new CleavageModelEstimatorThread(this, c, maxPos, repeats/nthreads,seed*(i+1));
 				threads[i].start();
 			}
-			
-			for (int i=0; i<nthreads; i++)
+
+			for (int i=0; i<n; i++)
 				try {
 					threads[i].join();
 				} catch (InterruptedException e) {
 					throw new RuntimeException("Interrupted",e);
 				}
-	
+
 			best = 0;
-			for (int i=1; i<nthreads; i++)
+			for (int i=1; i<n; i++)
 				if (threads[i].getBestLL()>threads[best].getBestLL())
 					best = i;
 		}

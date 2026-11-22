@@ -228,6 +228,8 @@ public class CodonInference {
 		if (cond<0) throw new RuntimeException("Inconsistent conditions!");
 		double[] act = null;
 		
+		int iters; // local: this object is shared by the codon inference threads
+		double lastDifference;
 		iters = 0;
 		do  {
 			m.computeExpectedReadsPerCodon();
@@ -320,6 +322,8 @@ public class CodonInference {
 //			System.out.println("Recalc "+m.computeLogLikelihood());
 			
 		}
+		this.iters = iters;
+		this.lastDifference = lastDifference;
 		
 		m.computeGoodnessOfFit();
 		
@@ -376,6 +380,8 @@ public class CodonInference {
 		if (cond<0) throw new RuntimeException("Inconsistent conditions!");
 		double[] act = null;
 		
+		int iters; // local: this object is shared by the codon inference threads
+		double lastDifference;
 		iters = 0;
 		do  {
 			m.computeExpectedReadsPerCodon();
@@ -468,6 +474,8 @@ public class CodonInference {
 //			System.out.println("Recalc "+m.computeLogLikelihood());
 			
 		}
+		this.iters = iters;
+		this.lastDifference = lastDifference;
 		
 		m.computeExpectedReadsPerCodon();
 		m.computePriorReadProbabilities();

@@ -14,13 +14,24 @@ public class CleavageModelEstimatorThread extends Thread {
 	private int repeats;
 	private int maxPos;
 	private long seed;
-	
+	private int from;
+	private int to;
+
 	public CleavageModelEstimatorThread(CleavageModelEstimator estimator, int c, int maxpos, int repeats, long seed) {
+		this(estimator, c, maxpos, repeats, seed, 0, Math.max(repeats,1));
+	}
+
+	/**
+	 * Only the repeats from (inclusive) to to (exclusive) of a thread with these repeats and this seed.
+	 */
+	public CleavageModelEstimatorThread(CleavageModelEstimator estimator, int c, int maxpos, int repeats, long seed, int from, int to) {
 		this.estimator = estimator;
 		this.c = c;
 		this.maxPos = maxpos<0?12:maxpos;
 		this.repeats = repeats;
 		this.seed = seed;
+		this.from = from;
+		this.to = to;
 	}
 	public double[] getBestPl() {
 		return bestPl;
@@ -47,8 +58,11 @@ public class CleavageModelEstimatorThread extends Thread {
 		
 		RandomNumbers rnd = new RandomNumbers();
 		if (seed>=0) rnd.setSeed(seed);
-		
-		for (int rep = 0; rep<Math.max(repeats,1); rep++) {
+		if (repeats>=1)
+			for (long i=0; i<2L*(estimator.obsMaxLength+1)*from; i++)
+				rnd.getUnif();
+
+		for (int rep = from; rep<to; rep++) {
 		
 			double u;
 			double[] Pl = new double[estimator.obsMaxLength+1];

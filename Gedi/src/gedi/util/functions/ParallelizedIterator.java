@@ -4,6 +4,7 @@ import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.Queue;
+import java.util.TreeMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
@@ -27,7 +28,8 @@ import java.util.logging.Logger;
  * 
  * 3. Drain thread: The thread that calls hasnext and next of this. It will block until one worker thread has put a result into the pq. Then it
  * will retrieve the result (based on the block index) and get its elements for iteration. If there are no more elements, it will again block until
- * a result becomes available.
+ * a result becomes available. Results are iterated in the order of the input blocks (as with a single worker); a result that arrives early waits
+ * until the blocks before it have been iterated.
  * 
  * Once the input iterator has no more elements, the controller thread will notify  a worker to process the last (not full) buffer, will shutdown all workers
  * and put a termination result object into the queue, that is taken by the drain thread as a signal that no more elements are available. 
@@ -156,6 +158,9 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 	
 	private long resultIndex = 0;
 	int nindex = 0;
+	private long nextBlock = 0;
+	private TreeMap<Long,ResultBlock> pending = new TreeMap<>();
+	private ResultBlock end = null;
 	private Object[] next = null;
 	private Throwable ex = null;
 	
@@ -196,14 +201,31 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 		
 		while (next==null || nindex>=next.length) {
 			
-			ResultBlock res;
-			try {
-				res = output.take();
-			} catch (InterruptedException e) {
-				nindex = -1;
+			ResultBlock res = pending.remove(nextBlock);
+			if (res==null && end!=null && !pending.isEmpty())
+				res = pending.pollFirstEntry().getValue(); // after the last block (an empty last block is skipped by its worker)
+			if (res==null && end==null) {
+				try {
+					res = output.take();
+				} catch (InterruptedException e) {
+					nindex = -1;
+					if (ex!=null) fatal(ex);
+					return;
+				}
 				if (ex!=null) fatal(ex);
-				return;
+				if (res.r==null) {
+					end = res;
+					continue;
+				}
+				if (res.index!=nextBlock) {
+					// release the worker unless too many results wait
+					if (pending.size()<64*runners.length)
+						res.take();
+					pending.put(res.index, res);
+					continue;
+				}
 			}
+			if (res==null) res = end;
 			if (ex!=null) fatal(ex);
 			if (res.r==null) {
 				nindex = -1;
@@ -219,6 +241,7 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 			
 			
 			resultIndex++;
+			nextBlock = res.index+1;
 			nindex = 0;
 			next = res.take();
 				
@@ -240,13 +263,14 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 	}
 	
 	private int blockIndex = 0;
+	private long taskIndex = 0;
 	private boolean consume(ExtendedIterator<I> in) {
 		if (block.size()==blockSize) {
 			try {
 				Worker runner = freeRunner.take();
 				if (blockStateMaker!=null)
 					blockStateMaker.accept(blockIndex++, runner.state);
-				runner.setTasks(block);
+				runner.setTasks(block,taskIndex++);
 				inputContr.addAndGet(block.size());
 				block.clear();
 				if (log.isLoggable(Level.FINE)) log.fine("Put block to worker thread "+runner.getName());
@@ -263,7 +287,7 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 	private void finish() {
 		try {
 			Worker runner = freeRunner.take();
-			runner.setTasks(block);
+			runner.setTasks(block,taskIndex++);
 			if (blockStateMaker!=null)
 				blockStateMaker.accept(blockIndex++, runner.state);
 			inputContr.addAndGet(block.size());
@@ -306,15 +330,25 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 	private static class ResultBlock {
 		private ParallelizedIterator.Worker runner;
 		private Object[] r;
+		private long index;
+		private boolean taken = false;
 		
 		public ResultBlock(ParallelizedIterator.Worker runner, Object[] r) {
+			this(runner,r,-1);
+		}
+		
+		public ResultBlock(ParallelizedIterator.Worker runner, Object[] r, long index) {
 			this.runner = runner;
 			this.r = r;
+			this.index = index;
 		}
 		
 		public Object[] take() {
-			synchronized (runner) {
-				runner.notify();	
+			if (!taken) {
+				taken = true;
+				synchronized (runner) {
+					runner.notify();	
+				}
 			}
 			return r;
 		}
@@ -326,6 +360,7 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 		
 		private ArrayList<I> tasks = new ArrayList<I>();
 		private ArrayList<O> output = new ArrayList<O>();
+		private long index;
 		private boolean shut = false;
 		private S state;
 		
@@ -364,7 +399,7 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 						outputWork.addAndGet(output.size());
 						
 						try {
-							ParallelizedIterator.this.output.put(new ResultBlock(this,output.toArray()));
+							ParallelizedIterator.this.output.put(new ResultBlock(this,output.toArray(),index));
 							output.clear();
 							wait();
 						} catch (InterruptedException e) {
@@ -393,8 +428,9 @@ public class ParallelizedIterator<I,O,S> implements ExtendedIterator<O>{
 		}
 		
 		
-		public synchronized void setTasks(ArrayList<I> tasks) {
+		public synchronized void setTasks(ArrayList<I> tasks, long index) {
 			this.tasks.addAll(tasks);
+			this.index = index;
 			notify();
 		}
 
