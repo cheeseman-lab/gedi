@@ -18,6 +18,7 @@ import gedi.riboseq.cleavage.RiboModel;
 import gedi.riboseq.cleavage.SimpleCodonModel;
 import gedi.util.ArrayUtils;
 import gedi.util.FunctorUtils;
+import gedi.util.SequenceUtils;
 import gedi.util.datastructure.tree.redblacktree.IntervalTreeSet;
 import gedi.util.functions.EI;
 import gedi.util.functions.ExtendedIterator;
@@ -150,16 +151,35 @@ public class CodonInference {
 		ArrayGenomicRegion reg = new ArrayGenomicRegion(Math.max(0, start-flanking),sequence==null?end+flanking:Math.min(end+flanking,sequence.getLength(ref.getName())));
 		
 		IntervalTreeSet<Codon> set = new IntervalTreeSet<Codon>(ref);
+		CharSequence plus = null; // sequence of reg, read once: a read per codon waits for the lock of the shared fasta file
+		boolean read = false;
 		for (Codon c : codons) {
 			if (reg.contains(c)) {
 				ArrayGenomicRegion p = reg.induce(c);
 				if (ref.getStrand()==Strand.Minus)
 					p = p.reverse(reg.getTotalLength());
-				set.add(new Codon(p, c.getActivity(), c.getTotalActivity(), c.getGoodness(), sequence==null?null:sequence.getSequence(ref, c)));
+				if (sequence!=null && !read) {
+					plus = sequence.getPlusSequence(ref.getName(), reg);
+					read = true;
+				}
+				set.add(new Codon(p, c.getActivity(), c.getTotalActivity(), c.getGoodness(), sequence==null?null:getSequence(ref, reg, plus, c)));
 			}
 		}
 		
 		return new ImmutableReferenceGenomicRegion<IntervalTreeSet<Codon>>(ref, reg, set);
+	}
+	
+	/**
+	 * The same as sequence.getSequence(ref,codon), from plus, the plus strand sequence of reg (which contains codon)
+	 */
+	private static CharSequence getSequence(ReferenceSequence ref, GenomicRegion reg, CharSequence plus, GenomicRegion codon) {
+		if (plus==null) return null;
+		StringBuilder sb = new StringBuilder();
+		for (int i=0; i<codon.getNumParts(); i++)
+			sb.append(plus, codon.getStart(i)-reg.getStart(), codon.getEnd(i)-reg.getStart());
+		if (ref.getStrand()==Strand.Minus)
+			return SequenceUtils.getDnaReverseComplement(sb);
+		return sb.toString();
 	}
 	
 	
