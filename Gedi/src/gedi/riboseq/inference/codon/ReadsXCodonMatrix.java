@@ -44,6 +44,12 @@ public class ReadsXCodonMatrix {
 	
 	private double total = 0;
 	
+	// codonProto/M and readProto/I in their iteration order, as arrays (the same entries, the same order); null after a change of the maps
+	private Codon[] codonIndex;
+	private double[][][] codonSlots;
+	private Read[] readIndex;
+	private double[][][] readSlots;
+	
 	// lm,len,vector of positions
 	private int[][][] probableCodonPositionsPerLength;
 	private double[][][] probableCodonPositionProbabilitiesPerLength;
@@ -136,6 +142,7 @@ public class ReadsXCodonMatrix {
 		if (!model.isValidReadLength(rgr.getRegion().getTotalLength())) return;
 		
 		plusStrand = rgr.getReference().getStrand()==Strand.Plus;
+		changed();
 		
 		if (rgr.getRegion().getTotalLength()>=probableCodonPositionsPerLength[0].length)
 			return;
@@ -183,6 +190,32 @@ public class ReadsXCodonMatrix {
 				r.totalCount+=c;
 				r.count = rgr.getData().addCountsForDistinct(d, r.count, ReadCountMode.Weight);
 				total+=c;
+			}
+		}
+	}
+	
+	private void changed() {
+		codonIndex = null;
+		readSlots = null;
+	}
+	
+	private void index() {
+		if (codonIndex==null) {
+			codonIndex = new Codon[codonProto.size()];
+			codonSlots = new double[codonIndex.length][][];
+			int i = 0;
+			for (Codon c : codonProto.keySet()) {
+				codonIndex[i] = c;
+				codonSlots[i++] = M.get(c).values().toArray(new double[0][]);
+			}
+		}
+		if (readSlots==null) {
+			readIndex = new Read[readProto.size()];
+			readSlots = new double[readIndex.length][][];
+			int i = 0;
+			for (Read r : readProto.keySet()) {
+				readIndex[i] = r;
+				readSlots[i++] = I.get(r).values().toArray(new double[0][]);
 			}
 		}
 	}
@@ -253,8 +286,9 @@ public class ReadsXCodonMatrix {
 	
 	
 	public void copySlots(int from, int to) {
-		for (Codon c : codonProto.keySet()) {
-			for (double[] s : M.get(c).values())
+		index();
+		for (double[][] cs : codonSlots) {
+			for (double[] s : cs)
 				s[to] = s[from];
 		}
 	}
@@ -294,9 +328,11 @@ public class ReadsXCodonMatrix {
 	 */
 	public void computeExpectedReadsPerCodon() {
 		// for each codon: iterate over entries and multiply by codon activity 
-		for (Codon c : codonProto.keySet()) {
-			for (double[] s : M.get(c).values())
-				s[1] = s[0]*c.totalActivity;
+		index();
+		for (int i=0; i<codonIndex.length; i++) {
+			double a = codonIndex[i].totalActivity;
+			for (double[] s : codonSlots[i])
+				s[1] = s[0]*a;
 		}
 	}
 	
@@ -360,6 +396,7 @@ public class ReadsXCodonMatrix {
 	
 	
 	public void removeZeroCodons() {
+		changed();
 		Iterator<Codon> it = codonProto.keySet().iterator();
 		while (it.hasNext()) {
 			Codon c = it.next();
@@ -534,10 +571,11 @@ public class ReadsXCodonMatrix {
 	public void computeGoodnessOfFit() {
 		computePriorReadProbabilities();
 		computeExpectedCodonPerRead();
-		for (Codon c : codonProto.keySet()) {
+		for (int i=0; i<codonIndex.length; i++) {
+			Codon c = codonIndex[i];
 			double ps = 0; // sum of propensities
 			double cs = 0; // sum of expected counts
-			for (double[] r : M.get(c).values()) {
+			for (double[] r : codonSlots[i]) {
 				ps+=r[0];
 				cs+=r[1];
 			}
@@ -547,7 +585,7 @@ public class ReadsXCodonMatrix {
 				ps=1;
 			}
 			double s = (1-ps)*cs;
-			for (double[] r : M.get(c).values()) {
+			for (double[] r : codonSlots[i]) {
 				double e = r[0]*cs;
 				double o = r[1];
 				double oe = o-e;
@@ -599,12 +637,13 @@ public class ReadsXCodonMatrix {
 	 * normalize slot 1 s.t. sums are 1 for each read
 	 */
 	public void computePriorReadProbabilities() {
-		for (Read r : readProto.keySet()) {
+		index();
+		for (double[][] rs : readSlots) {
 			double sum = 0;
-			for (double[] s : I.get(r).values())
+			for (double[] s : rs)
 				sum+=s[1];
 			if (sum>0)
-				for (double[] s : I.get(r).values())
+				for (double[] s : rs)
 					s[1]/=sum;
 		}
 	}
@@ -614,9 +653,11 @@ public class ReadsXCodonMatrix {
 	 * multiply slot 1 by the corresponding read count
 	 */
 	public void computeExpectedCodonPerRead() {
-		for (Read r : readProto.keySet()) {
-			for (double[] s : I.get(r).values())
-				s[1] *= r.totalCount;
+		index();
+		for (int i=0; i<readSlots.length; i++) {
+			double t = readIndex[i].totalCount;
+			for (double[] s : readSlots[i])
+				s[1] *= t;
 		}
 	}
 
@@ -624,9 +665,11 @@ public class ReadsXCodonMatrix {
 	 * multiply slot 1 by the corresponding read count from condition index; overwrites slot 1
 	 */
 	public void computeExpectedCodonPerRead(int index) {
-		for (Read r : readProto.keySet()) {
-			for (double[] s : I.get(r).values())
-				s[1] *= r.count[index];
+		index();
+		for (int i=0; i<readSlots.length; i++) {
+			double t = readIndex[i].count[index];
+			for (double[] s : readSlots[i])
+				s[1] *= t;
 		}
 	}
 	
@@ -653,12 +696,15 @@ public class ReadsXCodonMatrix {
 	 * @return
 	 */
 	public double computeExpectedCodons() {
+		index();
 		double re = 0;
-		for (Codon c : codonProto.keySet()) {
+		for (int i=0; i<codonIndex.length; i++) {
+			Codon c = codonIndex[i];
 			double prev = c.totalActivity;
-			c.totalActivity=0;
-			for (double[] s : M.get(c).values())
-				c.totalActivity += s[1];
+			double t = 0;
+			for (double[] s : codonSlots[i])
+				t += s[1];
+			c.totalActivity = t;
 			re=Math.max(re,Math.abs(prev-c.totalActivity));
 		}
 		return re;
@@ -710,12 +756,15 @@ public class ReadsXCodonMatrix {
 	 * @return
 	 */
 	public double computeExpectedCodons(int index) {
+		index();
 		double re = 0;
-		for (Codon c : codonProto.keySet()) {
+		for (int i=0; i<codonIndex.length; i++) {
+			Codon c = codonIndex[i];
 			double prev = c.activity[index];
-			c.activity[index]=0;
-			for (double[] s : M.get(c).values())
-				c.activity[index] += s[1];
+			double t = 0;
+			for (double[] s : codonSlots[i])
+				t += s[1];
+			c.activity[index] = t;
 			re+=Math.abs(prev-c.activity[index]);
 		}
 		return re;
