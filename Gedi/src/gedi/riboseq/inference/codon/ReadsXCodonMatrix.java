@@ -23,6 +23,9 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
+import java.util.function.IntConsumer;
 
 
 
@@ -49,6 +52,11 @@ public class ReadsXCodonMatrix {
 	private double[][][] codonSlots;
 	private Read[] readIndex;
 	private double[][][] readSlots;
+	private int entries;
+	
+	// sweeps over a large matrix in parallel; each codon (read) of a sweep is computed by one task, as in one thread
+	private ForkJoinPool pool;
+	private static final int PARALLEL_ENTRIES = 1<<16;
 	
 	// lm,len,vector of positions
 	private int[][][] probableCodonPositionsPerLength;
@@ -194,6 +202,33 @@ public class ReadsXCodonMatrix {
 		}
 	}
 	
+	public void setPool(ForkJoinPool pool) {
+		this.pool = pool;
+	}
+	
+	/**
+	 * Calls body for 0..n-1; for a large matrix in parallel (so body must only write data of its own index)
+	 */
+	private void sweep(int n, IntConsumer body) {
+		if (pool==null || entries<PARALLEL_ENTRIES || n<2) {
+			for (int i=0; i<n; i++)
+				body.accept(i);
+			return;
+		}
+		int k = Math.min(n, pool.getParallelism()*4);
+		ArrayList<ForkJoinTask<?>> tasks = new ArrayList<ForkJoinTask<?>>(k);
+		for (int t=0; t<k; t++) {
+			int from = (int)((long)n*t/k);
+			int to = (int)((long)n*(t+1)/k);
+			tasks.add(pool.submit(()->{
+				for (int i=from; i<to; i++)
+					body.accept(i);
+			}));
+		}
+		for (ForkJoinTask<?> t : tasks)
+			t.join();
+	}
+	
 	private void changed() {
 		codonIndex = null;
 		readSlots = null;
@@ -204,9 +239,11 @@ public class ReadsXCodonMatrix {
 			codonIndex = new Codon[codonProto.size()];
 			codonSlots = new double[codonIndex.length][][];
 			int i = 0;
+			entries = 0;
 			for (Codon c : codonProto.keySet()) {
 				codonIndex[i] = c;
-				codonSlots[i++] = M.get(c).values().toArray(new double[0][]);
+				codonSlots[i] = M.get(c).values().toArray(new double[0][]);
+				entries+=codonSlots[i++].length;
 			}
 		}
 		if (readSlots==null) {
@@ -287,10 +324,10 @@ public class ReadsXCodonMatrix {
 	
 	public void copySlots(int from, int to) {
 		index();
-		for (double[][] cs : codonSlots) {
-			for (double[] s : cs)
+		sweep(codonSlots.length, i->{
+			for (double[] s : codonSlots[i])
 				s[to] = s[from];
-		}
+		});
 	}
 	
 	
@@ -329,11 +366,11 @@ public class ReadsXCodonMatrix {
 	public void computeExpectedReadsPerCodon() {
 		// for each codon: iterate over entries and multiply by codon activity 
 		index();
-		for (int i=0; i<codonIndex.length; i++) {
+		sweep(codonIndex.length, i->{
 			double a = codonIndex[i].totalActivity;
 			for (double[] s : codonSlots[i])
 				s[1] = s[0]*a;
-		}
+		});
 	}
 	
 	public double computeLogLikelihood() {
@@ -571,7 +608,7 @@ public class ReadsXCodonMatrix {
 	public void computeGoodnessOfFit() {
 		computePriorReadProbabilities();
 		computeExpectedCodonPerRead();
-		for (int i=0; i<codonIndex.length; i++) {
+		sweep(codonIndex.length, i->{
 			Codon c = codonIndex[i];
 			double ps = 0; // sum of propensities
 			double cs = 0; // sum of expected counts
@@ -592,7 +629,7 @@ public class ReadsXCodonMatrix {
 				s+=oe*oe/e;
 			}
 			c.goodness = s;
-		}
+		});
 		
 	}
 	
@@ -638,14 +675,15 @@ public class ReadsXCodonMatrix {
 	 */
 	public void computePriorReadProbabilities() {
 		index();
-		for (double[][] rs : readSlots) {
+		sweep(readSlots.length, i->{
+			double[][] rs = readSlots[i];
 			double sum = 0;
 			for (double[] s : rs)
 				sum+=s[1];
 			if (sum>0)
 				for (double[] s : rs)
 					s[1]/=sum;
-		}
+		});
 	}
 
 
@@ -654,11 +692,11 @@ public class ReadsXCodonMatrix {
 	 */
 	public void computeExpectedCodonPerRead() {
 		index();
-		for (int i=0; i<readSlots.length; i++) {
+		sweep(readSlots.length, i->{
 			double t = readIndex[i].totalCount;
 			for (double[] s : readSlots[i])
 				s[1] *= t;
-		}
+		});
 	}
 
 	/**
@@ -666,11 +704,11 @@ public class ReadsXCodonMatrix {
 	 */
 	public void computeExpectedCodonPerRead(int index) {
 		index();
-		for (int i=0; i<readSlots.length; i++) {
+		sweep(readSlots.length, i->{
 			double t = readIndex[i].count[index];
 			for (double[] s : readSlots[i])
 				s[1] *= t;
-		}
+		});
 	}
 	
 	public double getTotal() {
@@ -697,16 +735,19 @@ public class ReadsXCodonMatrix {
 	 */
 	public double computeExpectedCodons() {
 		index();
-		double re = 0;
-		for (int i=0; i<codonIndex.length; i++) {
+		double[] diff = new double[codonIndex.length];
+		sweep(codonIndex.length, i->{
 			Codon c = codonIndex[i];
 			double prev = c.totalActivity;
 			double t = 0;
 			for (double[] s : codonSlots[i])
 				t += s[1];
 			c.totalActivity = t;
-			re=Math.max(re,Math.abs(prev-c.totalActivity));
-		}
+			diff[i] = Math.abs(prev-c.totalActivity);
+		});
+		double re = 0;
+		for (int i=0; i<diff.length; i++)
+			re=Math.max(re,diff[i]);
 		return re;
 	}
 	
@@ -757,16 +798,19 @@ public class ReadsXCodonMatrix {
 	 */
 	public double computeExpectedCodons(int index) {
 		index();
-		double re = 0;
-		for (int i=0; i<codonIndex.length; i++) {
+		double[] diff = new double[codonIndex.length];
+		sweep(codonIndex.length, i->{
 			Codon c = codonIndex[i];
 			double prev = c.activity[index];
 			double t = 0;
 			for (double[] s : codonSlots[i])
 				t += s[1];
 			c.activity[index] = t;
-			re+=Math.abs(prev-c.activity[index]);
-		}
+			diff[i] = Math.abs(prev-c.activity[index]);
+		});
+		double re = 0;
+		for (int i=0; i<diff.length; i++)
+			re+=diff[i];
 		return re;
 	}
 	

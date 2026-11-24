@@ -66,7 +66,8 @@ public class PriceCodonInference extends GediProgram {
 		CodonInference ci = new CodonInference(model,g)
 		.setFilter(filter)
 //		.setRho(rho)
-		.setRegularization(delta);
+		.setRegularization(delta)
+		.setThreads(nthreads);
 		
 		context.getLog().log(Level.INFO, "Codon inference");
 		AtomicInteger count = new AtomicInteger(0);

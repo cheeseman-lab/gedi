@@ -33,6 +33,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Set;
 import java.util.Spliterators;
+import java.util.concurrent.ForkJoinPool;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.ToDoubleFunction;
@@ -47,6 +48,7 @@ public class CodonInference {
 	private SequenceProvider sequence;
 	private double lambda = 1;
 	private Predicate<ReferenceGenomicRegion<AlignedReadsData>> filter;
+	private ForkJoinPool pool;
 //	private double rho;
 	
 	
@@ -80,6 +82,14 @@ public class CodonInference {
 	
 	public CodonInference setRegularization(double lambda) {
 		this.lambda = lambda;
+		return this;
+	}
+	
+	/**
+	 * Threads for the EM of a large cluster (each codon and each read of a sweep is computed by one thread, so the result is the same)
+	 */
+	public CodonInference setThreads(int nthreads) {
+		this.pool = nthreads>1?new ForkJoinPool(nthreads):null;
 		return this;
 	}
 	
@@ -236,6 +246,7 @@ public class CodonInference {
 		}
 		
 		ReadsXCodonMatrix m = new ReadsXCodonMatrix(model, condition);
+		m.setPool(pool);
 		int readcount = m.addAll(reads);
 		m.finishReads();
 		
