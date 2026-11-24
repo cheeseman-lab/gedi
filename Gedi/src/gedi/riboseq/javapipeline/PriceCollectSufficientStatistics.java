@@ -24,6 +24,7 @@ public class PriceCollectSufficientStatistics extends GediProgram {
 		addInput(params.reads);
 		addInput(params.percond);
 		addInput(params.skipmt);
+		addInput(params.nthreads);
 		addOutput(params.estimateData);
 	}
 	
@@ -36,9 +37,11 @@ public class PriceCollectSufficientStatistics extends GediProgram {
 		GenomicRegionStorage<AlignedReadsData> reads = getParameter(3);
 		boolean percond = getBooleanParameter(4);
 		boolean skipMt = getBooleanParameter(5);
+		int nthreads = getIntParameter(6);
 		
 		CleavageModelEstimator em = new CleavageModelEstimator(genomic.getTranscripts(),reads,filter);
 		em.setProgress(context.getProgress());
+		em.setThreads(nthreads);
 		if (skipMt)
 			em.setSkiptMT(skipMt);
 		

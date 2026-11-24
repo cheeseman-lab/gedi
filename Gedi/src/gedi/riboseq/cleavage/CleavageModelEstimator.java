@@ -5,6 +5,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinTask;
 import java.util.function.BinaryOperator;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
@@ -45,6 +47,7 @@ public class CleavageModelEstimator {
 	private boolean skiptMT = false;
 	
 	private int maxMulti = 1;
+	private int nthreads = 1;
 	private int maxLength = 50;
 	
 	int obsMinLength = -1;
@@ -91,6 +94,13 @@ public class CleavageModelEstimator {
 
 	public void setSeed(long seed) {
 		this.seed = seed;
+	}
+	
+	/**
+	 * Threads for collectEstimateData (the same result as one thread)
+	 */
+	public void setThreads(int nthreads) {
+		this.nthreads = nthreads;
 	}
 	
 	public void setProgress(Progress progress) {
@@ -263,124 +273,69 @@ public class CleavageModelEstimator {
 		double[][] summary = new double[ReadPositionType.values().length][mapping.getNumMergedConditions()];
 		ArrayList<ImmutableReferenceGenomicRegion<Transcript>> buff = new ArrayList<ImmutableReferenceGenomicRegion<Transcript>>();
 		
-		for (ReferenceSequence r : refs) {
-			ExtendedIterator<ImmutableReferenceGenomicRegion<AlignedReadsData>> it = reads.ei(r);
-			if (filter!=null) 
-				it = it.filter(filter);
-			while (it.hasNext()) {
-				ImmutableReferenceGenomicRegion<AlignedReadsData> rgr = it.next();
-				if (skiptMT && (rgr.getReference().getChrStrippedName().equals("MT") || rgr.getReference().getChrStrippedName().equals("M"))) continue;
-				
-				progress.incrementProgress();
-				progress.setDescription(()->"Collecting statistics "+rgr.toLocationString());
-				
-				GenomicRegion read = rgr.getRegion();
-				int first = -1;
-				int last = -1;
-				
-				buff.clear();
-				annotation.getReferenceRegionsIntersecting(rgr.getReference(), rgr.getRegion(),buff);
-				
-				for (ImmutableReferenceGenomicRegion<Transcript> transRgr : buff) {
-					GenomicRegion trans = transRgr.getRegion();
-					
-					if (transRgr.getData().isCoding() && trans.containsUnspliced(read)) {
-						
-						int startIn = trans.induce(transRgr.getData().getCodingStart());
-						int endIn = trans.induce(transRgr.getData().getCodingEnd()-1)+1;
-						int cdslen = endIn-startIn;
-						
-						if (cdslen%3!=0)
-							continue;
-						
-						GenomicRegion mread = trans.induce(read);
-						
-						if (mread.getEnd()>=startIn+3 && mread.getStart()<=endIn-3) {
-						
-							mread = mread.translate(-startIn);
-						
-							int firstCand,lastCand;
-							
-							firstCand = mread.getStart()<=0 ? -mread.getStart() : (3-mread.getStart()%3)%3 ;
-							lastCand = mread.getEnd()>=cdslen?cdslen-mread.getStart()-3:firstCand+((mread.getTotalLength()-firstCand)/3-1)*3;
-							if (lastCand<firstCand || (lastCand-firstCand)%3!=0
-									|| (firstCand>2 && lastCand<mread.getTotalLength()-5)
-									|| firstCand<0 || firstCand>mread.getTotalLength()-3 
-									|| lastCand<0 || lastCand>mread.getTotalLength()-3) {
-//								throw new RuntimeException(transRgr+" "+read+" "+mread.getTotalLength()+": "+firstCand+"-"+lastCand);
-								// very short cds can lead to this!
-								first = last = -2;
-								continue;
-							}
-							
-							if (transRgr.getReference().getStrand()==Strand.Minus) {
-								int tmp = firstCand;
-								firstCand = mread.getTotalLength()-1-(lastCand+2);
-								lastCand = mread.getTotalLength()-1-(tmp+2);
-							}
-								
-							
-							if (first==-1) {
-								first = firstCand;
-								last = lastCand;
-							} else if (first!=firstCand || last!=lastCand) {
-								first = last = -2;
-							}
+		int[] minmax = {-1,-1};
+		
+		if (nthreads<=1) {
+			for (ReferenceSequence r : refs) 
+				collectEstimateData(r, data, summary, minmax, buff, null, true);
+		} else {
+			// references in parallel, each into its own arrays, then summed: exact (in any order) as every count is a multiple of 1/2
+			// and the sum of their absolute values is below 2^50; if not, all references once more in one thread, as above
+			ReferenceSequence[] rs = refs.toArray(new ReferenceSequence[0]);
+			double[][][][][] rdata = new double[rs.length][][][][];
+			double[][][] rsummary = new double[rs.length][][];
+			int[][] rminmax = new int[rs.length][];
+			double[] rabs = new double[rs.length];
+			ForkJoinPool pool = new ForkJoinPool(nthreads);
+			try {
+				ArrayList<ForkJoinTask<?>> tasks = new ArrayList<ForkJoinTask<?>>();
+				for (int i=0; i<rs.length; i++) {
+					int ui = i;
+					tasks.add(pool.submit(()->{
+						rdata[ui] = new double[maxLength+1][3][2][mapping.getNumMergedConditions()];
+						rsummary[ui] = new double[ReadPositionType.values().length][mapping.getNumMergedConditions()];
+						rminmax[ui] = new int[] {-1,-1};
+						rabs[ui] = collectEstimateData(rs[ui], rdata[ui], rsummary[ui], rminmax[ui], new ArrayList<ImmutableReferenceGenomicRegion<Transcript>>(), new double[mapping.getNumMergedConditions()], false);
+					}));
+				}
+				for (ForkJoinTask<?> t : tasks)
+					t.join();
+			} finally {
+				pool.shutdown();
+			}
+			boolean exact = true;
+			double abs = 0;
+			for (int i=0; i<rs.length; i++) {
+				exact &= rabs[i]>=0;
+				abs += rabs[i];
+			}
+			if (exact && abs<0x1p50) {
+				for (int i=0; i<rs.length; i++) {
+					for (int t=0; t<summary.length; t++)
+						for (int c=0; c<summary[t].length; c++)
+							summary[t][c]+=rsummary[i][t][c];
+					for (int l=0; l<data.length; l++)
+						for (int f=0; f<data[l].length; f++)
+							for (int lm=0; lm<data[l][f].length; lm++)
+								for (int c=0; c<data[l][f][lm].length; c++)
+									data[l][f][lm][c]+=rdata[i][l][f][lm][c];
+					if (rminmax[i][1]!=-1) {
+						if (minmax[1]==-1) {
+							minmax[0] = rminmax[i][0];
+							minmax[1] = rminmax[i][1];
+						} else {
+							minmax[1] = Math.max(rminmax[i][1],minmax[1]);
+							minmax[0] = Math.min(rminmax[i][0],minmax[0]);
 						}
 					}
 				}
-				
-				ConditionMappedAlignedReadsData mard = new ConditionMappedAlignedReadsData(rgr.getData(), mapping);
-				
-				ReadPositionType type = ReadPositionType.INTERNAL;
-				if (first == -1) type = ReadPositionType.NO_CODING;
-				else if (first == -2) type = ReadPositionType.MULTI;
-				else if (first>2 && last<read.getTotalLength()-5) type = ReadPositionType.STARTSTOP;
-				else if (first>2) type = ReadPositionType.START;
-				else if (last<read.getTotalLength()-5) type = ReadPositionType.STOP;
-				
-				int l = read.getTotalLength();
-				if (l>maxLength) continue;
-				
-				if (obsMaxLength==-1) {
-					obsMaxLength = l;
-					obsMinLength = l;
-				} else {
-					obsMaxLength = Math.max(l,obsMaxLength);
-					obsMinLength = Math.min(l,obsMinLength);
-				}
-				
-	//			double[] mmc = new double[5];
-				for (int d=0; d<mard.getDistinctSequences(); d++) {
-					
-					if (mard.getMultiplicity(d)<=maxMulti) {
-	//					mard.addCount(d,summary[type.ordinal()],true);
-						mard.addCountsForDistinct(d, summary[type.ordinal()], ReadCountMode.Weight);
-						
-						if (type==ReadPositionType.INTERNAL){		
-	//						mard.addCount(d, data[l][first%3][RiboUtils.hasLeadingMismatch(mard, d)?1:0],true);
-						
-							if (RiboUtils.hasLeadingMismatch(mard, d)) {
-								if (RiboUtils.isLeadingMismatchInsideGenomicRegion(mard, d)) 
-									mard.addCountsForDistinct(d, data[l][first%3][1], ReadCountMode.Weight);
-								else if (l+1<=maxLength) // if it were inside, the read would be one bp longer and the codon position would one farther away; longer than maxLength: skipped, like any read longer than maxLength
-									mard.addCountsForDistinct(d, data[l+1][(first+1)%3][1], ReadCountMode.Weight);
-							} else
-								mard.addCountsForDistinct(d, data[l][first%3][0], ReadCountMode.Weight);
-	//						if (RiboUtils.hasLeadingMismatch(mard, d))
-	//							mmc[SequenceUtils.inv_nucleotides[RiboUtils.getLeadingMismatch(mard, d)]]+=mard.getTotalCountForDistinct(d, ReadCountMode.Weight);// mard.getSumCount(d);
-	//						else 
-	//							mmc[4]+=mard.getTotalCountForDistinct(d, ReadCountMode.Weight);//mard.getSumCount(d);
-						}
-						
-					}
-				}
-				
-	//			if (ArrayUtils.sum(mmc)>100)
-	//				System.out.printf("%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",mmc[0],mmc[1],mmc[2],mmc[3],mmc[4]);
-				
+			} else {
+				for (ReferenceSequence r : refs) 
+					collectEstimateData(r, data, summary, minmax, buff, null, true);
 			}
 		}
+		obsMinLength = minmax[0];
+		obsMaxLength = minmax[1];
 		
 		progress.finish();
 		
@@ -395,6 +350,150 @@ public class CleavageModelEstimator {
 			summaryFile.writeLine(ReadPositionType.values()[i]+"\t"+StringUtils.concat("\t", summary[i]));
 		summaryFile.finishWriting();
 		
+	}
+	
+	/**
+	 * The reads of r (the loop body of collectEstimateData), added to data and summary; minmax: smallest and largest read length (-1: none yet).
+	 * If check is given (a buffer), returns the sum of the absolute values of the counts added if each is a multiple of 1/2 (below 2^40), -1 otherwise.
+	 */
+	private double collectEstimateData(ReferenceSequence r, double[][][][] data, double[][] summary, int[] minmax, 
+			ArrayList<ImmutableReferenceGenomicRegion<Transcript>> buff, double[] check, boolean showProgress) {
+		double abs = 0;
+		ExtendedIterator<ImmutableReferenceGenomicRegion<AlignedReadsData>> it = reads.ei(r);
+		if (filter!=null) 
+			it = it.filter(filter);
+		while (it.hasNext()) {
+			ImmutableReferenceGenomicRegion<AlignedReadsData> rgr = it.next();
+			if (skiptMT && (rgr.getReference().getChrStrippedName().equals("MT") || rgr.getReference().getChrStrippedName().equals("M"))) continue;
+			
+			if (showProgress) {
+				progress.incrementProgress();
+				progress.setDescription(()->"Collecting statistics "+rgr.toLocationString());
+			}
+			
+			GenomicRegion read = rgr.getRegion();
+			int first = -1;
+			int last = -1;
+			
+			buff.clear();
+			annotation.getReferenceRegionsIntersecting(rgr.getReference(), rgr.getRegion(),buff);
+			
+			for (ImmutableReferenceGenomicRegion<Transcript> transRgr : buff) {
+				GenomicRegion trans = transRgr.getRegion();
+				
+				if (transRgr.getData().isCoding() && trans.containsUnspliced(read)) {
+					
+					int startIn = trans.induce(transRgr.getData().getCodingStart());
+					int endIn = trans.induce(transRgr.getData().getCodingEnd()-1)+1;
+					int cdslen = endIn-startIn;
+					
+					if (cdslen%3!=0)
+						continue;
+					
+					GenomicRegion mread = trans.induce(read);
+					
+					if (mread.getEnd()>=startIn+3 && mread.getStart()<=endIn-3) {
+					
+						mread = mread.translate(-startIn);
+					
+						int firstCand,lastCand;
+						
+						firstCand = mread.getStart()<=0 ? -mread.getStart() : (3-mread.getStart()%3)%3 ;
+						lastCand = mread.getEnd()>=cdslen?cdslen-mread.getStart()-3:firstCand+((mread.getTotalLength()-firstCand)/3-1)*3;
+						if (lastCand<firstCand || (lastCand-firstCand)%3!=0
+								|| (firstCand>2 && lastCand<mread.getTotalLength()-5)
+								|| firstCand<0 || firstCand>mread.getTotalLength()-3 
+								|| lastCand<0 || lastCand>mread.getTotalLength()-3) {
+//								throw new RuntimeException(transRgr+" "+read+" "+mread.getTotalLength()+": "+firstCand+"-"+lastCand);
+							// very short cds can lead to this!
+							first = last = -2;
+							continue;
+						}
+						
+						if (transRgr.getReference().getStrand()==Strand.Minus) {
+							int tmp = firstCand;
+							firstCand = mread.getTotalLength()-1-(lastCand+2);
+							lastCand = mread.getTotalLength()-1-(tmp+2);
+						}
+							
+						
+						if (first==-1) {
+							first = firstCand;
+							last = lastCand;
+						} else if (first!=firstCand || last!=lastCand) {
+							first = last = -2;
+						}
+					}
+				}
+			}
+			
+			ConditionMappedAlignedReadsData mard = new ConditionMappedAlignedReadsData(rgr.getData(), mapping);
+			
+			ReadPositionType type = ReadPositionType.INTERNAL;
+			if (first == -1) type = ReadPositionType.NO_CODING;
+			else if (first == -2) type = ReadPositionType.MULTI;
+			else if (first>2 && last<read.getTotalLength()-5) type = ReadPositionType.STARTSTOP;
+			else if (first>2) type = ReadPositionType.START;
+			else if (last<read.getTotalLength()-5) type = ReadPositionType.STOP;
+			
+			int l = read.getTotalLength();
+			if (l>maxLength) continue;
+			
+			if (minmax[1]==-1) {
+				minmax[1] = l;
+				minmax[0] = l;
+			} else {
+				minmax[1] = Math.max(l,minmax[1]);
+				minmax[0] = Math.min(l,minmax[0]);
+			}
+			
+//			double[] mmc = new double[5];
+			for (int d=0; d<mard.getDistinctSequences(); d++) {
+				
+				if (mard.getMultiplicity(d)<=maxMulti) {
+					if (check!=null && abs>=0) 
+						abs = addHalfIntegers(abs, mard.addCountsForDistinct(d, check, ReadCountMode.Weight));
+//					mard.addCount(d,summary[type.ordinal()],true);
+					mard.addCountsForDistinct(d, summary[type.ordinal()], ReadCountMode.Weight);
+					
+					if (type==ReadPositionType.INTERNAL){		
+//						mard.addCount(d, data[l][first%3][RiboUtils.hasLeadingMismatch(mard, d)?1:0],true);
+					
+						if (RiboUtils.hasLeadingMismatch(mard, d)) {
+							if (RiboUtils.isLeadingMismatchInsideGenomicRegion(mard, d)) 
+								mard.addCountsForDistinct(d, data[l][first%3][1], ReadCountMode.Weight);
+							else if (l+1<=maxLength) // if it were inside, the read would be one bp longer and the codon position would one farther away; longer than maxLength: skipped, like any read longer than maxLength
+								mard.addCountsForDistinct(d, data[l+1][(first+1)%3][1], ReadCountMode.Weight);
+						} else
+							mard.addCountsForDistinct(d, data[l][first%3][0], ReadCountMode.Weight);
+//						if (RiboUtils.hasLeadingMismatch(mard, d))
+//							mmc[SequenceUtils.inv_nucleotides[RiboUtils.getLeadingMismatch(mard, d)]]+=mard.getTotalCountForDistinct(d, ReadCountMode.Weight);// mard.getSumCount(d);
+//						else 
+//							mmc[4]+=mard.getTotalCountForDistinct(d, ReadCountMode.Weight);//mard.getSumCount(d);
+					}
+					
+				}
+			}
+			
+//			if (ArrayUtils.sum(mmc)>100)
+//				System.out.printf("%.0f\t%.0f\t%.0f\t%.0f\t%.0f\n",mmc[0],mmc[1],mmc[2],mmc[3],mmc[4]);
+			
+		}
+		return abs;
+	}
+	
+	/**
+	 * abs plus the absolute values of a, if they are multiples of 1/2 below 2^40 (-1 otherwise); clears a
+	 */
+	private static double addHalfIntegers(double abs, double[] a) {
+		for (int i=0; i<a.length; i++) {
+			double h = a[i]*2;
+			if (h!=Math.rint(h) || Math.abs(a[i])>=0x1p40) 
+				return -1;
+			abs += Math.abs(a[i]);
+			a[i] = 0;
+		}
+		return abs;
 	}
 	
 	public double[] getTotal() {
